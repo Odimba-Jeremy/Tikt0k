@@ -17,30 +17,30 @@ CORS(app)
 # Logs
 logging.basicConfig(level=logging.INFO)
 
-# Rate limit global
+# Rate limit global (fix Limiter)
 limiter = Limiter(
-    get_remote_address,
-    app=app,
+    app=app,                    # L'application Flask
+    key_func=get_remote_address, # IP du client
     default_limits=["20 per minute"]
 )
 
 # Temp folder pour les vidéos
 TEMP_FOLDER = tempfile.gettempdir()
 
-# Nettoyage automatique
+# ------------------- Nettoyage automatique -------------------
 def cleanup_temp():
     while True:
         now = time.time()
         for f in os.listdir(TEMP_FOLDER):
-            if f.startswith("tiktok_"):
+            if f.startswith("tiktok_") and f.endswith(".mp4"):
                 path = os.path.join(TEMP_FOLDER, f)
                 try:
-                    if now - os.path.getmtime(path) > 600:  # 10 min
+                    if now - os.path.getmtime(path) > 600:  # 10 minutes
                         os.remove(path)
                         logging.info(f"Supprimé {path}")
                 except Exception as e:
                     logging.error(f"Erreur nettoyage: {e}")
-        time.sleep(300)  # toutes les 5 min
+        time.sleep(300)  # toutes les 5 minutes
 
 threading.Thread(target=cleanup_temp, daemon=True).start()
 
@@ -68,16 +68,16 @@ def download_tiktok(url):
         "outtmpl": filepath,
         "noplaylist": True,
         "quiet": True,
-        "retries": 3,  # tente 3 fois si échec
+        "retries": 3,
         "ignoreerrors": True
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-    
+
     if not os.path.exists(filepath):
         raise Exception("Téléchargement échoué")
-    
+
     return filepath
 
 # ------------------- Routes -------------------
@@ -86,7 +86,7 @@ def health():
     return jsonify({"status": "online"}), 200
 
 @app.route("/download", methods=["POST"])
-@limiter.limit("10 per minute")
+@limiter.limit("10 per minute")  # Limite spécifique sur cette route
 def download():
     data = request.get_json()
     if not data or "url" not in data:
@@ -98,10 +98,7 @@ def download():
         return jsonify({"error": error}), 400
 
     try:
-        # Téléchargement
         filepath = download_tiktok(url)
-
-        # Envoi au client
         return send_file(
             filepath,
             mimetype="video/mp4",
