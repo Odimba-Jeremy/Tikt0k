@@ -52,7 +52,7 @@ def validate_url(url):
     if len(url) > 300:
         return "URL trop longue"
     
-    pattern = r'https?://(www\.|vm\.)?tiktok\.com/.+'
+    pattern = r'https?://([a-zA-Z0-9-]+\.)?tiktok\.com/.+'
     if not re.match(pattern, url):
         return "Lien TikTok invalide"
     return None
