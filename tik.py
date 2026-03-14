@@ -17,10 +17,10 @@ CORS(app)
 # Logs
 logging.basicConfig(level=logging.INFO)
 
-# Rate limit global (fix Limiter)
+# Rate limit global
 limiter = Limiter(
-    app=app,                    # L'application Flask
-    key_func=get_remote_address, # IP du client
+    app=app,
+    key_func=get_remote_address,
     default_limits=["20 per minute"]
 )
 
@@ -32,10 +32,10 @@ def cleanup_temp():
     while True:
         now = time.time()
         for f in os.listdir(TEMP_FOLDER):
-            if f.startswith("tiktok_") and f.endswith(".mp4"):
+            if f.startswith("media_") and f.endswith(".mp4"):
                 path = os.path.join(TEMP_FOLDER, f)
                 try:
-                    if now - os.path.getmtime(path) > 600:  # 10 minutes
+                    if now - os.path.getmtime(path) > 600:  # 10 min
                         os.remove(path)
                         logging.info(f"Supprimé {path}")
                 except Exception as e:
@@ -46,20 +46,26 @@ threading.Thread(target=cleanup_temp, daemon=True).start()
 
 # ------------------- Fonctions -------------------
 def validate_url(url):
-    """Validation stricte TikTok"""
+    """Validation pour YouTube, TikTok, Instagram, Facebook, Threads"""
     if not url:
         return "URL manquante"
-    if len(url) > 300:
+
+    if len(url) > 500:
         return "URL trop longue"
-    
-    pattern = r'https?://([a-zA-Z0-9-]+\.)?tiktok\.com/.+'
+
+    pattern = (
+        r'https?://(www\.)?'
+        r'(youtube\.com|youtu\.be|tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|'
+        r'instagram\.com|facebook\.com|fb\.watch|threads\.net)/.+'
+    )
     if not re.match(pattern, url):
-        return "Lien TikTok invalide"
+        return "Plateforme non supportée"
+
     return None
 
-def download_tiktok(url):
-    """Télécharge la vidéo et retourne le chemin"""
-    filename = f"tiktok_{int(time.time())}.mp4"
+def download_media(url):
+    """Télécharge la vidéo depuis la plateforme et retourne le chemin"""
+    filename = f"media_{int(time.time())}.mp4"
     filepath = os.path.join(TEMP_FOLDER, filename)
 
     ydl_opts = {
@@ -69,11 +75,12 @@ def download_tiktok(url):
         "noplaylist": True,
         "quiet": True,
         "retries": 3,
-        "ignoreerrors": True
+        "ignoreerrors": True,
+        "progress_hooks": [],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        ydl.extract_info(url, download=True)
 
     if not os.path.exists(filepath):
         raise Exception("Téléchargement échoué")
@@ -86,7 +93,7 @@ def health():
     return jsonify({"status": "online"}), 200
 
 @app.route("/download", methods=["POST"])
-@limiter.limit("10 per minute")  # Limite spécifique sur cette route
+@limiter.limit("10 per minute")
 def download():
     data = request.get_json()
     if not data or "url" not in data:
@@ -98,16 +105,33 @@ def download():
         return jsonify({"error": error}), 400
 
     try:
-        filepath = download_tiktok(url)
+        filepath = download_media(url)
         return send_file(
             filepath,
             mimetype="video/mp4",
             as_attachment=True,
-            download_name="tiktok_video.mp4"
+            download_name="media_video.mp4"
         )
     except Exception as e:
         logging.error(f"Téléchargement échoué: {e}")
         return jsonify({"error": "Erreur lors du téléchargement"}), 500
+
+# ------------------- Auto-ping pour uptime (toutes les 14m30) -------------------
+def auto_ping():
+    import requests
+    ping_url = os.environ.get("PING_URL")  # URL de ton API pour se réveiller
+    if not ping_url:
+        logging.warning("PING_URL non défini")
+        return
+    while True:
+        try:
+            requests.get(ping_url, timeout=10)
+            logging.info(f"Ping effectué vers {ping_url}")
+        except Exception as e:
+            logging.error(f"Erreur ping: {e}")
+        time.sleep(870)  # 14 minutes 30 secondes = 870 sec
+
+threading.Thread(target=auto_ping, daemon=True).start()
 
 # ------------------- Exécution -------------------
 if __name__ == "__main__":
