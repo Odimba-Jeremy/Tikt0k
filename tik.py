@@ -4,55 +4,54 @@ import time
 import threading
 import tempfile
 import logging
-from flask import Flask, request, jsonify, send_file
+import uuid
+import requests
+
+from flask import Flask, request, jsonify, send_file, after_this_request
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import yt_dlp
 
-# ------------------- Configuration -------------------
+# ------------------- CONFIG -------------------
 app = Flask(__name__)
 CORS(app)
-
-# Logs
 logging.basicConfig(level=logging.INFO)
 
-# Rate limit global
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
     default_limits=["20 per minute"]
 )
 
-# Temp folder pour les vidéos
 TEMP_FOLDER = tempfile.gettempdir()
+jobs = {}  # stockage des jobs
 
-# ------------------- Nettoyage automatique -------------------
+# ------------------- CLEANUP -------------------
 def cleanup_temp():
     while True:
         now = time.time()
-        for f in os.listdir(TEMP_FOLDER):
-            if f.startswith("media_") and f.endswith(".mp4"):
-                path = os.path.join(TEMP_FOLDER, f)
-                try:
-                    if now - os.path.getmtime(path) > 600:  # 10 min
+        for job_id in list(jobs.keys()):
+            job = jobs[job_id]
+            if "file" in job:
+                path = job["file"]
+                if os.path.exists(path) and now - os.path.getmtime(path) > 600:
+                    try:
                         os.remove(path)
+                        del jobs[job_id]
                         logging.info(f"Supprimé {path}")
-                except Exception as e:
-                    logging.error(f"Erreur nettoyage: {e}")
-        time.sleep(300)  # toutes les 5 minutes
+                    except Exception as e:
+                        logging.error(f"Erreur suppression: {e}")
+        time.sleep(300)
 
 threading.Thread(target=cleanup_temp, daemon=True).start()
 
-# ------------------- Fonctions -------------------
+# ------------------- VALIDATION -------------------
 def validate_url(url):
-    """Validation pour YouTube, TikTok, Instagram, Facebook, Threads"""
     if not url:
         return "URL manquante"
-
     if len(url) > 500:
         return "URL trop longue"
-
     pattern = (
         r'https?://(www\.)?'
         r'(youtube\.com|youtu\.be|tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|'
@@ -60,66 +59,139 @@ def validate_url(url):
     )
     if not re.match(pattern, url):
         return "Plateforme non supportée"
-
     return None
 
-def download_media(url):
-    """Télécharge la vidéo depuis la plateforme et retourne le chemin"""
-    filename = f"media_{int(time.time())}.mp4"
-    filepath = os.path.join(TEMP_FOLDER, filename)
+# ------------------- DOWNLOAD WORKER -------------------
+def download_worker(job_id, url, download_type, resolution):
+    try:
+        jobs[job_id]["status"] = "downloading"
 
-    ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "outtmpl": filepath,
-        "noplaylist": True,
-        "quiet": True,
-        "retries": 3,
-        "ignoreerrors": True,
-        "progress_hooks": [],
-    }
+        filename = f"media_{uuid.uuid4().hex}"
+        filepath = os.path.join(TEMP_FOLDER, filename)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info(url, download=True)
+        # Options yt_dlp
+        ydl_opts = {
+            "quiet": True,
+            "retries": 3,
+            "ignoreerrors": False,
+        }
 
-    if not os.path.exists(filepath):
-        raise Exception("Téléchargement échoué")
+        # ---------------- TYPE AUDIO ----------------
+        if download_type == "audio":
+            ydl_opts.update({
+                "format": "bestaudio/best",
+                "outtmpl": filepath + ".mp3",
+                "postprocessors": [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+            })
+            filepath += ".mp3"
 
-    return filepath
+        # ---------------- TYPE VIDEO ----------------
+        elif download_type == "video":
+            # Mapping résolution
+            format_map = {
+                "480p": "best[height<=480]",
+                "HD": "best[height<=720]",
+                "UHD": "best[height<=1080]",
+                "4K": "best[height<=2160]",
+            }
+            fmt = format_map.get(resolution, "bestvideo+bestaudio/best")
+            ydl_opts.update({
+                "format": fmt,
+                "merge_output_format": "mp4",
+                "outtmpl": filepath + ".mp4",
+                "noplaylist": True
+            })
+            filepath += ".mp4"
 
-# ------------------- Routes -------------------
+        # ---------------- TYPE PHOTO (TikTok uniquement) ----------------
+        elif download_type == "photo":
+            ydl_opts.update({
+                "skip_download": False,
+                "writethumbnail": True,
+                "outtmpl": filepath + ".%(ext)s",
+            })
+            # yt_dlp mettra l’extension correcte (.jpg ou .png)
+            filepath += ".jpg"  # placeholder
+
+        else:
+            jobs[job_id]["status"] = "error"
+            return
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # si c’est une photo TikTok, récupère thumbnail réel
+            if download_type == "photo" and "thumbnail" in info:
+                thumb_url = info["thumbnail"]
+                thumb_path = os.path.join(TEMP_FOLDER, f"{filename}.jpg")
+                import requests
+                r = requests.get(thumb_url, stream=True)
+                if r.status_code == 200:
+                    with open(thumb_path, "wb") as f:
+                        for chunk in r.iter_content(1024):
+                            f.write(chunk)
+                    filepath = thumb_path
+
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["file"] = filepath
+
+    except Exception as e:
+        logging.error(f"Erreur job {job_id}: {e}")
+        jobs[job_id]["status"] = "error"
+
+# ------------------- ROUTES -------------------
+
 @app.route("/")
 def health():
     return jsonify({"status": "online"}), 200
 
 @app.route("/download", methods=["POST"])
 @limiter.limit("10 per minute")
-def download():
+def start_download():
     data = request.get_json()
     if not data or "url" not in data:
         return jsonify({"error": "URL manquante"}), 400
 
     url = data["url"].strip()
+    download_type = data.get("type", "video")  # video/audio/photo
+    resolution = data.get("resolution", "HD")  # par défaut HD
+
     error = validate_url(url)
     if error:
         return jsonify({"error": error}), 400
 
-    try:
-        filepath = download_media(url)
-        return send_file(
-            filepath,
-            mimetype="video/mp4",
-            as_attachment=True,
-            download_name="media_video.mp4"
-        )
-    except Exception as e:
-        logging.error(f"Téléchargement échoué: {e}")
-        return jsonify({"error": "Erreur lors du téléchargement"}), 500
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "pending"}
 
-# ------------------- Auto-ping pour uptime (toutes les 14m30) -------------------
+    threading.Thread(target=download_worker, args=(job_id, url, download_type, resolution), daemon=True).start()
+
+    return jsonify({"job_id": job_id, "status": "started"})
+
+@app.route("/status/<job_id>")
+def check_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job introuvable"}), 404
+    return jsonify({"status": job["status"]})
+
+@app.route("/file/<job_id>")
+def get_file(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job introuvable"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": "Pas prêt"}), 400
+
+    filepath = job["file"]
+    return send_file(filepath, as_attachment=True)
+
+# ------------------- AUTO PING -------------------
+
 def auto_ping():
-    import requests
-    ping_url = os.environ.get("PING_URL")  # URL de ton API pour se réveiller
+    ping_url = os.environ.get("PING_URL")
     if not ping_url:
         logging.warning("PING_URL non défini")
         return
@@ -129,12 +201,13 @@ def auto_ping():
             logging.info(f"Ping effectué vers {ping_url}")
         except Exception as e:
             logging.error(f"Erreur ping: {e}")
-        time.sleep(870)  # 14 minutes 30 secondes = 870 sec
+        time.sleep(870)
 
 threading.Thread(target=auto_ping, daemon=True).start()
 
-# ------------------- Exécution -------------------
+# ------------------- RUN -------------------
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    logging.info(f"Serveur démarré sur le port {port}")
+    logging.info(f"Serveur lancé sur port {port}")
     app.run(host="0.0.0.0", port=port)
