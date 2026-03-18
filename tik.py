@@ -7,22 +7,14 @@ import logging
 import uuid
 import requests
 
-from flask import Flask, request, jsonify, send_file, after_this_request
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import yt_dlp
 
 # ------------------- CONFIG -------------------
 app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
-
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["20 per minute"]
-)
 
 TEMP_FOLDER = tempfile.gettempdir()
 jobs = {}  # stockage des jobs
@@ -62,36 +54,41 @@ def validate_url(url):
     return None
 
 # ------------------- DOWNLOAD WORKER -------------------
-def download_worker(job_id, url, download_type, resolution):
+def download_worker(job_id, url, resolution=None):
     try:
         jobs[job_id]["status"] = "downloading"
-
         filename = f"media_{uuid.uuid4().hex}"
         filepath = os.path.join(TEMP_FOLDER, filename)
 
-        # Options yt_dlp
-        ydl_opts = {
-            "quiet": True,
-            "retries": 3,
-            "ignoreerrors": False,
-        }
+        ydl_opts = {"quiet": True, "retries": 3, "ignoreerrors": False}
 
-        # ---------------- TYPE AUDIO ----------------
-        if download_type == "audio":
+        # ---------------- DETECTION AUTOMATIQUE ----------------
+        download_type = "video"
+        if "tiktok.com" in url and "/photo/" in url:
+            download_type = "photo"
+
+        # ---------------- PHOTO TIKTOK ----------------
+        if download_type == "photo":
             ydl_opts.update({
-                "format": "bestaudio/best",
-                "outtmpl": filepath + ".mp3",
-                "postprocessors": [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }]
+                "skip_download": False,
+                "writethumbnail": True,
+                "outtmpl": filepath + ".%(ext)s",
             })
-            filepath += ".mp3"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if "thumbnail" in info:
+                    thumb_url = info["thumbnail"]
+                    thumb_path = os.path.join(TEMP_FOLDER, f"{filename}.jpg")
+                    r = requests.get(thumb_url, stream=True)
+                    if r.status_code == 200:
+                        with open(thumb_path, "wb") as f:
+                            for chunk in r.iter_content(1024):
+                                f.write(chunk)
+                        filepath = thumb_path
 
-        # ---------------- TYPE VIDEO ----------------
-        elif download_type == "video":
-            # Mapping résolution
+        # ---------------- VIDEO OU AUDIO ----------------
+        else:
+            # VIDEO
             format_map = {
                 "480p": "best[height<=480]",
                 "HD": "best[height<=720]",
@@ -107,57 +104,30 @@ def download_worker(job_id, url, download_type, resolution):
             })
             filepath += ".mp4"
 
-        # ---------------- TYPE PHOTO (TikTok uniquement) ----------------
-        elif download_type == "photo":
-            ydl_opts.update({
-                "skip_download": False,
-                "writethumbnail": True,
-                "outtmpl": filepath + ".%(ext)s",
-            })
-            # yt_dlp mettra l’extension correcte (.jpg ou .png)
-            filepath += ".jpg"  # placeholder
-
-        else:
-            jobs[job_id]["status"] = "error"
-            return
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # si c’est une photo TikTok, récupère thumbnail réel
-            if download_type == "photo" and "thumbnail" in info:
-                thumb_url = info["thumbnail"]
-                thumb_path = os.path.join(TEMP_FOLDER, f"{filename}.jpg")
-                import requests
-                r = requests.get(thumb_url, stream=True)
-                if r.status_code == 200:
-                    with open(thumb_path, "wb") as f:
-                        for chunk in r.iter_content(1024):
-                            f.write(chunk)
-                    filepath = thumb_path
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["file"] = filepath
+        jobs[job_id]["type"] = download_type
 
     except Exception as e:
         logging.error(f"Erreur job {job_id}: {e}")
         jobs[job_id]["status"] = "error"
 
 # ------------------- ROUTES -------------------
-
 @app.route("/")
 def health():
     return jsonify({"status": "online"}), 200
 
 @app.route("/download", methods=["POST"])
-@limiter.limit("10 per minute")
 def start_download():
     data = request.get_json()
     if not data or "url" not in data:
         return jsonify({"error": "URL manquante"}), 400
 
     url = data["url"].strip()
-    download_type = data.get("type", "video")  # video/audio/photo
-    resolution = data.get("resolution", "HD")  # par défaut HD
+    resolution = data.get("resolution", "HD")
 
     error = validate_url(url)
     if error:
@@ -166,7 +136,7 @@ def start_download():
     job_id = uuid.uuid4().hex
     jobs[job_id] = {"status": "pending"}
 
-    threading.Thread(target=download_worker, args=(job_id, url, download_type, resolution), daemon=True).start()
+    threading.Thread(target=download_worker, args=(job_id, url, resolution), daemon=True).start()
 
     return jsonify({"job_id": job_id, "status": "started"})
 
@@ -175,7 +145,7 @@ def check_status(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job introuvable"}), 404
-    return jsonify({"status": job["status"]})
+    return jsonify({"status": job["status"], "type": job.get("type")})
 
 @app.route("/file/<job_id>")
 def get_file(job_id):
@@ -184,29 +154,10 @@ def get_file(job_id):
         return jsonify({"error": "Job introuvable"}), 404
     if job["status"] != "done":
         return jsonify({"error": "Pas prêt"}), 400
-
     filepath = job["file"]
     return send_file(filepath, as_attachment=True)
 
-# ------------------- AUTO PING -------------------
-
-def auto_ping():
-    ping_url = os.environ.get("PING_URL")
-    if not ping_url:
-        logging.warning("PING_URL non défini")
-        return
-    while True:
-        try:
-            requests.get(ping_url, timeout=10)
-            logging.info(f"Ping effectué vers {ping_url}")
-        except Exception as e:
-            logging.error(f"Erreur ping: {e}")
-        time.sleep(870)
-
-threading.Thread(target=auto_ping, daemon=True).start()
-
 # ------------------- RUN -------------------
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Serveur lancé sur port {port}")
